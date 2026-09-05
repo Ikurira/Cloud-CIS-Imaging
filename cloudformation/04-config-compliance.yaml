@@ -1,0 +1,279 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CIS hardening pipeline - generic compliance-evaluator Lambda + the AWS
+  Config Conformance Pack (custom rules + remediation wiring) for both
+  RHEL9 and Windows Server 2025. Deploy 00-shared.yaml, 02-ssm-enforcement.yaml,
+  and 03-remediation.yaml first, all with the same NamePrefix. Also requires
+  an AWS Config configuration recorder + delivery channel already enabled in
+  this account/region. See ../../docs/architecture.md.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cis-hardening
+
+Resources:
+  ComplianceEvaluatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${NamePrefix}-compliance-evaluator'
+      Description: >-
+        Generic OS-level CIS compliance evaluator: reads SSM Compliance data
+        and reports to AWS Config. Same function backs every benchmark's
+        Config rule.
+      Role: !ImportValue
+        Fn::Sub: '${NamePrefix}-ConfigEvaluatorLambdaRoleArn'
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          """Generic AWS Config custom rule evaluator for CIS OS-level compliance.
+
+          One Lambda serves every CIS benchmark (RHEL9, Windows Server 2025, and any
+          future OS added to the pipeline) - which benchmark it evaluates is entirely
+          driven by the Config rule's InputParameters, never by code branching here.
+
+          Config never talks to the target instance directly. It reads compliance
+          state that the SSM State Manager enforcement association already published
+          to the SSM Compliance API (see hardening-content/CONTRACT.md).
+
+          Expected rule InputParameters:
+            ComplianceType : the SSM Custom compliance type to read, e.g. "Custom:CIS-RHEL9"
+            TagKey         : instance tag key that puts an instance in scope, e.g. "CISBenchmark"
+            TagValue       : instance tag value that puts an instance in scope, e.g. "RHEL9"
+          """
+
+          import json
+          import boto3
+
+          ssm = boto3.client("ssm")
+          ec2 = boto3.client("ec2")
+          config = boto3.client("config")
+
+
+          def _in_scope_instance_ids(tag_key, tag_value):
+              paginator = ec2.get_paginator("describe_instances")
+              ids = []
+              for page in paginator.paginate(
+                  Filters=[
+                      {"Name": f"tag:{tag_key}", "Values": [tag_value]},
+                      {"Name": "instance-state-name", "Values": ["running"]},
+                  ]
+              ):
+                  for reservation in page["Reservations"]:
+                      for instance in reservation["Instances"]:
+                          ids.append(instance["InstanceId"])
+              return ids
+
+
+          def _instance_compliance(instance_id, compliance_type):
+              """Returns (status, annotation) for one instance based on its most recent
+              SSM compliance items of the given type. NON_COMPLIANT if any control
+              failed or no data has ever been published (fail closed, not open)."""
+              try:
+                  paginator = ssm.get_paginator("list_compliance_items")
+                  items = []
+                  for page in paginator.paginate(
+                      ResourceIds=[instance_id],
+                      ResourceTypes=["ManagedInstance"],
+                      Filters=[{"Key": "ComplianceType", "Values": [compliance_type]}],
+                  ):
+                      items.extend(page["ComplianceItems"])
+              except Exception as exc:  # noqa: BLE001 - report, don't crash the evaluation
+                  return "NON_COMPLIANT", f"Could not read SSM compliance data: {exc}"
+
+              if not items:
+                  return "NON_COMPLIANT", "No SSM compliance data published yet for this instance"
+
+              non_compliant = [i for i in items if i.get("Status") != "COMPLIANT"]
+              if non_compliant:
+                  ids = ", ".join(sorted({i["Id"] for i in non_compliant}))[:250]
+                  return "NON_COMPLIANT", f"{len(non_compliant)} control(s) failing: {ids}"
+
+              return "COMPLIANT", f"All {len(items)} evaluated control(s) compliant"
+
+
+          def handler(event, _context):
+              invoking_event = json.loads(event["invokingEvent"])
+              rule_parameters = json.loads(event.get("ruleParameters", "{}"))
+
+              compliance_type = rule_parameters["ComplianceType"]
+              tag_key = rule_parameters["TagKey"]
+              tag_value = rule_parameters["TagValue"]
+
+              result_token = event["resultToken"]
+              evaluations = []
+
+              for instance_id in _in_scope_instance_ids(tag_key, tag_value):
+                  status, annotation = _instance_compliance(instance_id, compliance_type)
+                  evaluations.append(
+                      {
+                          "ComplianceResourceType": "AWS::EC2::Instance",
+                          "ComplianceResourceId": instance_id,
+                          "ComplianceType": status,
+                          "Annotation": annotation[:256],
+                          "OrderingTimestamp": invoking_event["notificationCreationTime"],
+                      }
+                  )
+
+              if not evaluations:
+                  return {"message": f"No in-scope instances found for {tag_key}={tag_value}"}
+
+              # PutEvaluations caps at 100 per call.
+              for i in range(0, len(evaluations), 100):
+                  config.put_evaluations(
+                      Evaluations=evaluations[i : i + 100],
+                      ResultToken=result_token,
+                  )
+
+              return {"evaluated": len(evaluations)}
+
+  ComplianceEvaluatorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ComplianceEvaluatorFunction
+      Principal: config.amazonaws.com
+
+  # AWS Config Conformance Pack -- "AWS Config Conformance Pack (CIS Benchmark
+  # Evaluation)" in the architecture diagram. TemplateBody is itself a
+  # conformance-pack-flavored CFN template that AWS Config parses and deploys
+  # independently, *after* this stack finishes -- a completely separate
+  # Fn::Sub/Ref evaluation pass from this outer stack's own.
+  #
+  # To avoid the nested-Fn::Sub escaping trap (CloudFormation's escape token
+  # for a literal "${x}" is "${!x}", not Terraform's "$${x}" -- easy to get
+  # wrong), the InputParameters JSON strings below are fully resolved HERE,
+  # in the outer Fn::Sub, using imported values -- the inner template does
+  # not do its own Fn::Sub at all. LambdaFunctionArn/AutomationAssumeRoleArn/
+  # EnforceDocumentName* remain genuine inner-template Parameters (populated
+  # via ConformancePackInputParameters below) because they're referenced with
+  # plain "!Ref X" tags in the embedded text, which contain no "${" sequence
+  # and so pass through this outer Sub completely untouched.
+  CisConformancePack:
+    Type: AWS::Config::ConformancePack
+    DependsOn: ComplianceEvaluatorPermission
+    Properties:
+      ConformancePackName: !Sub '${NamePrefix}-cis-benchmarks'
+      TemplateBody: !Sub
+        - |
+          Parameters:
+            LambdaFunctionArn:
+              Type: String
+            AutomationAssumeRoleArn:
+              Type: String
+            EnforceDocumentNameRhel9:
+              Type: String
+            EnforceDocumentNameWindows2025:
+              Type: String
+
+          Resources:
+            CisRhel9ComplianceRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: ${NamePrefix}-cis-rhel9-compliance
+                Description: >-
+                  Evaluates EC2 instances tagged as RHEL9 CIS-hardened against the
+                  Custom:CIS-RHEL9 compliance type published by the SSM State
+                  Manager enforcement association. Never inspects the instance
+                  directly.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref LambdaFunctionArn
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MessageType: ScheduledNotification
+                      MaximumExecutionFrequency: One_Hour
+                InputParameters: '{"ComplianceType":"Custom:CIS-RHEL9","TagKey":"${TagKeyValue}","TagValue":"${TagValueRhel9Value}"}'
+
+            CisRhel9Remediation:
+              Type: AWS::Config::RemediationConfiguration
+              Properties:
+                ConfigRuleName: !Ref CisRhel9ComplianceRule
+                TargetType: SSM_DOCUMENT
+                TargetId: ${AutomationDocumentNameValue}
+                TargetVersion: "1"
+                Automatic: true
+                MaximumAutomaticAttempts: 3
+                RetryAttemptSeconds: 600
+                Parameters:
+                  AutomationAssumeRole:
+                    StaticValue:
+                      Values:
+                        - !Ref AutomationAssumeRoleArn
+                  InstanceId:
+                    ResourceValue:
+                      Value: RESOURCE_ID
+                  EnforceDocumentName:
+                    StaticValue:
+                      Values:
+                        - !Ref EnforceDocumentNameRhel9
+
+            CisWindows2025ComplianceRule:
+              Type: AWS::Config::ConfigRule
+              Properties:
+                ConfigRuleName: ${NamePrefix}-cis-windows2025-compliance
+                Description: >-
+                  Evaluates EC2 instances tagged as Windows Server 2025
+                  CIS-hardened against the Custom:CIS-WindowsServer2025
+                  compliance type published by the SSM State Manager
+                  enforcement association. Never inspects the instance directly.
+                Source:
+                  Owner: CUSTOM_LAMBDA
+                  SourceIdentifier: !Ref LambdaFunctionArn
+                  SourceDetails:
+                    - EventSource: aws.config
+                      MessageType: ScheduledNotification
+                      MaximumExecutionFrequency: One_Hour
+                InputParameters: '{"ComplianceType":"Custom:CIS-WindowsServer2025","TagKey":"${TagKeyValue}","TagValue":"${TagValueWindows2025Value}"}'
+
+            CisWindows2025Remediation:
+              Type: AWS::Config::RemediationConfiguration
+              Properties:
+                ConfigRuleName: !Ref CisWindows2025ComplianceRule
+                TargetType: SSM_DOCUMENT
+                TargetId: ${AutomationDocumentNameValue}
+                TargetVersion: "1"
+                Automatic: true
+                MaximumAutomaticAttempts: 3
+                RetryAttemptSeconds: 600
+                Parameters:
+                  AutomationAssumeRole:
+                    StaticValue:
+                      Values:
+                        - !Ref AutomationAssumeRoleArn
+                  InstanceId:
+                    ResourceValue:
+                      Value: RESOURCE_ID
+                  EnforceDocumentName:
+                    StaticValue:
+                      Values:
+                        - !Ref EnforceDocumentNameWindows2025
+        - TagKeyValue: !ImportValue
+            Fn::Sub: '${NamePrefix}-TagKeyBenchmark'
+          TagValueRhel9Value: !ImportValue
+            Fn::Sub: '${NamePrefix}-TagValueRhel9'
+          TagValueWindows2025Value: !ImportValue
+            Fn::Sub: '${NamePrefix}-TagValueWindows2025'
+          AutomationDocumentNameValue: !ImportValue
+            Fn::Sub: '${NamePrefix}-AutomationDocumentName'
+      ConformancePackInputParameters:
+        - ParameterName: LambdaFunctionArn
+          ParameterValue: !GetAtt ComplianceEvaluatorFunction.Arn
+        - ParameterName: AutomationAssumeRoleArn
+          ParameterValue: !ImportValue
+            Fn::Sub: '${NamePrefix}-SsmAutomationRoleArn'
+        - ParameterName: EnforceDocumentNameRhel9
+          ParameterValue: !ImportValue
+            Fn::Sub: '${NamePrefix}-EnforceDocumentNameRhel9'
+        - ParameterName: EnforceDocumentNameWindows2025
+          ParameterValue: !ImportValue
+            Fn::Sub: '${NamePrefix}-EnforceDocumentNameWindows2025'
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt ComplianceEvaluatorFunction.Arn
+  ConformancePackName:
+    Value: !Ref CisConformancePack

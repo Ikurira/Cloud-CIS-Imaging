@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CIS hardening pipeline - shared foundation (KMS, artifact bucket, SNS, IAM,
+  tag/parameter contract). Deploy this stack first; every other stack in this
+  pipeline imports its outputs by name using the same NamePrefix parameter.
+  See ../../docs/architecture.md for the full design.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cis-hardening
+    Description: Prefix for all resource names and the Export names downstream stacks import.
+
+  TagKeyBenchmark:
+    Type: String
+    Default: CISBenchmark
+  TagKeyLevel:
+    Type: String
+    Default: CISBenchmarkLevel
+  TagValueRhel9:
+    Type: String
+    Default: RHEL9
+  TagValueWindows2025:
+    Type: String
+    Default: WindowsServer2025
+
+  LandingZoneAccountRootArns:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Optional: root ARNs (arn:aws:iam::<account-id>:root) of landing-zone
+      accounts that should be able to read the artifact bucket and decrypt
+      with the KMS key, so their instances can run continuous enforcement
+      too. Leave the default empty for a single-account test deployment.
+
+Conditions:
+  HasLandingZoneAccounts: !Not [!Equals [!Join [',', !Ref LandingZoneAccountRootArns], '']]
+
+Resources:
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub '${NamePrefix} artifact & pipeline encryption key'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - !If
+            - HasLandingZoneAccounts
+            - Sid: LandingZoneDecrypt
+              Effect: Allow
+              Principal:
+                AWS: !Ref LandingZoneAccountRootArns
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: '*'
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${NamePrefix}-key'
+
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${NamePrefix}'
+      TargetKeyId: !Ref KmsKey
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${NamePrefix}-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: HasLandingZoneAccounts
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: LandingZoneRead
+            Effect: Allow
+            Principal:
+              AWS: !Ref LandingZoneAccountRootArns
+            Action: s3:GetObject
+            Resource: !Sub '${ArtifactBucket.Arn}/*'
+          - Sid: LandingZoneList
+            Effect: Allow
+            Principal:
+              AWS: !Ref LandingZoneAccountRootArns
+            Action: s3:ListBucket
+            Resource: !GetAtt ArtifactBucket.Arn
+
+  ArtifactUriParameterRhel9:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${NamePrefix}/artifacts/rhel9/s3-uri'
+      Type: String
+      Value: !Sub 's3://${ArtifactBucket}/rhel9-cis/UNRELEASED'
+      Description: >-
+        Placeholder. Overwrite via `aws ssm put-parameter ... --overwrite`
+        after packaging/uploading hardening-content — see hardening-content/README.md.
+
+  ArtifactUriParameterWindows2025:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${NamePrefix}/artifacts/windows2025/s3-uri'
+      Type: String
+      Value: !Sub 's3://${ArtifactBucket}/windows2025-cis/UNRELEASED'
+
+  TagKeyBenchmarkParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${NamePrefix}/tags/benchmark-key'
+      Type: String
+      Value: !Ref TagKeyBenchmark
+
+  TagKeyLevelParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${NamePrefix}/tags/level-key'
+      Type: String
+      Value: !Ref TagKeyLevel
+
+  PipelineNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${NamePrefix}-notifications'
+      KmsMasterKeyId: !Ref KmsKey
+
+  PipelineNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref PipelineNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeAndConfigPublish
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - config.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref PipelineNotificationsTopic
+
+  SnsTopicArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${NamePrefix}/sns/pipeline-topic-arn'
+      Type: String
+      Value: !Ref PipelineNotificationsTopic
+
+  ImageBuilderInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-image-builder-instance'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: artifact-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadHardeningArtifacts
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+              - Sid: ListHardeningArtifacts
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt ArtifactBucket.Arn
+              - Sid: DecryptArtifacts
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt KmsKey.Arn
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${NamePrefix}-image-builder-instance'
+      Roles:
+        - !Ref ImageBuilderInstanceRole
+
+  SsmAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-ssm-automation'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ssm-automation-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: RunAndTrackCommands
+                Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ssm:DescribeInstanceInformation
+                Resource: '*'
+              - Sid: DescribeInstances
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Sid: Notify
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref PipelineNotificationsTopic
+
+  ConfigEvaluatorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${NamePrefix}-config-evaluator'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: config-evaluator-permissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ReadSsmCompliance
+                Effect: Allow
+                Action:
+                  - ssm:ListComplianceItems
+                  - ssm:ListResourceComplianceSummaries
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Sid: ReportToConfig
+                Effect: Allow
+                Action: config:PutEvaluations
+                Resource: '*'
+
+Outputs:
+  KmsKeyArn:
+    Value: !GetAtt KmsKey.Arn
+    Export:
+      Name: !Sub '${NamePrefix}-KmsKeyArn'
+
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub '${NamePrefix}-ArtifactBucketName'
+
+  ArtifactParameterNameRhel9:
+    Value: !Ref ArtifactUriParameterRhel9
+    Export:
+      Name: !Sub '${NamePrefix}-ArtifactParameterNameRhel9'
+
+  ArtifactParameterNameWindows2025:
+    Value: !Ref ArtifactUriParameterWindows2025
+    Export:
+      Name: !Sub '${NamePrefix}-ArtifactParameterNameWindows2025'
+
+  SnsTopicArn:
+    Value: !Ref PipelineNotificationsTopic
+    Export:
+      Name: !Sub '${NamePrefix}-SnsTopicArn'
+
+  ImageBuilderInstanceProfileName:
+    Value: !Ref ImageBuilderInstanceProfile
+    Export:
+      Name: !Sub '${NamePrefix}-ImageBuilderInstanceProfileName'
+
+  SsmAutomationRoleArn:
+    Value: !GetAtt SsmAutomationRole.Arn
+    Export:
+      Name: !Sub '${NamePrefix}-SsmAutomationRoleArn'
+
+  ConfigEvaluatorLambdaRoleArn:
+    Value: !GetAtt ConfigEvaluatorLambdaRole.Arn
+    Export:
+      Name: !Sub '${NamePrefix}-ConfigEvaluatorLambdaRoleArn'
+
+  TagKeyBenchmark:
+    Value: !Ref TagKeyBenchmark
+    Export:
+      Name: !Sub '${NamePrefix}-TagKeyBenchmark'
+
+  TagKeyLevel:
+    Value: !Ref TagKeyLevel
+    Export:
+      Name: !Sub '${NamePrefix}-TagKeyLevel'
+
+  TagValueRhel9:
+    Value: !Ref TagValueRhel9
+    Export:
+      Name: !Sub '${NamePrefix}-TagValueRhel9'
+
+  TagValueWindows2025:
+    Value: !Ref TagValueWindows2025
+    Export:
+      Name: !Sub '${NamePrefix}-TagValueWindows2025'

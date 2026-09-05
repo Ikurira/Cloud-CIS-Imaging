@@ -1,0 +1,67 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CIS hardening pipeline - generic SSM Automation auto-remediation runbook.
+  Deploy 00-shared.yaml first with the same NamePrefix. See ../../docs/architecture.md.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cis-hardening
+
+Resources:
+  AutoRemediateDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${NamePrefix}-auto-remediate'
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: >-
+          Generic CIS auto-remediation runbook. Fired by AWS Config's
+          Remediation Configuration when a rule reports NON_COMPLIANT.
+          Re-invokes the same enforcement SSM document State Manager already
+          uses. Contains no benchmark-specific logic itself - which
+          document/instance to act on is entirely parameter-driven, so this
+          one runbook backs every OS the pipeline supports.
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          InstanceId:
+            type: String
+            description: The non-compliant instance, supplied by AWS Config.
+          EnforceDocumentName:
+            type: String
+            description: Name of the enforcement SSM Command document to re-run on InstanceId.
+          AutomationAssumeRole:
+            type: String
+            default: !ImportValue
+              Fn::Sub: '${NamePrefix}-SsmAutomationRoleArn'
+          SnsTopicArn:
+            type: String
+            default: !ImportValue
+              Fn::Sub: '${NamePrefix}-SnsTopicArn'
+        mainSteps:
+          - name: RunEnforcement
+            action: aws:runCommand
+            timeoutSeconds: 3600
+            inputs:
+              DocumentName: '{{ EnforceDocumentName }}'
+              InstanceIds:
+                - '{{ InstanceId }}'
+          - name: Notify
+            action: aws:executeAwsApi
+            isEnd: true
+            inputs:
+              Service: sns
+              Api: Publish
+              TopicArn: '{{ SnsTopicArn }}'
+              # {{ ... }} here is SSM Automation's own runtime substitution, not
+              # CloudFormation's -- left as a plain string on purpose.
+              Message: 'CIS auto-remediation executed on {{ InstanceId }} via {{ EnforceDocumentName }}'
+              Subject: CIS auto-remediation fired
+
+Outputs:
+  AutomationDocumentName:
+    Value: !Ref AutoRemediateDocument
+    Export:
+      Name: !Sub '${NamePrefix}-AutomationDocumentName'

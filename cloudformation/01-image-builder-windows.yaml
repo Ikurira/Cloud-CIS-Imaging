@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CIS hardening pipeline - Windows Server 2025 Image Builder recipe/pipeline/
+  distribution. Deploy 00-shared.yaml first with the same NamePrefix. See
+  ../../docs/architecture.md.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cis-hardening
+    Description: Must match the NamePrefix used when deploying 00-shared.yaml.
+
+  BaseAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2025-English-Full-Base
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+
+  InstanceType:
+    Type: String
+    Default: m5.xlarge
+
+  CisLevel:
+    Type: String
+    Default: '1'
+    AllowedValues: ['1', '2']
+
+  CisProfile:
+    Type: String
+    Default: server
+    AllowedValues: [server, workstation]
+
+  LandingZoneAccountIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Optional AWS account IDs (bare, not ARNs) to grant AMI launch permission to.
+
+  PipelineScheduleExpression:
+    Type: String
+    Default: cron(0 8 ? * SUN *)
+
+Conditions:
+  HasLandingZoneAccounts: !Not [!Equals [!Join [',', !Ref LandingZoneAccountIds], '']]
+
+Resources:
+  HardeningComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub '${NamePrefix}-windows2025-cis-harden'
+      Description: Native (PowerShell only, no Ansible/WinRM) CIS Windows Server 2025 hardening.
+      Platform: Windows
+      Version: 1.0.0
+      Data: !Sub
+        - |
+          name: WindowsServer2025-CIS-Hardening
+          description: >-
+            Applies CIS Windows Server 2025 hardening natively (no Ansible/WinRM).
+            Resolves the current hardening-content artifact from SSM Parameter
+            Store at build time - see hardening-content/CONTRACT.md.
+          schemaVersion: 1.0
+          phases:
+            - name: build
+              steps:
+                - name: DownloadHardeningArtifact
+                  action: ExecutePowerShell
+                  inputs:
+                    commands:
+                      - $ErrorActionPreference = "Stop"
+                      - $s3Uri = (Get-SSMParameter -Name '${ArtifactParameterName}' -Region '${AWS::Region}').Value
+                      - Write-Host "Resolved hardening artifact:$s3Uri"
+                      - New-Item -ItemType Directory -Force -Path C:\CISHardening | Out-Null
+                      - $parts = $s3Uri -replace '^s3://', '' -split '/', 2
+                      - Read-S3Object -BucketName $parts[0] -Key $parts[1] -File C:\CISHardening\windows2025-cis.zip -Region '${AWS::Region}'
+                      - Expand-Archive -Path C:\CISHardening\windows2025-cis.zip -DestinationPath C:\CISHardening -Force
+                - name: Remediate
+                  action: ExecutePowerShell
+                  inputs:
+                    commands:
+                      - C:\CISHardening\windows2025-cis\run.ps1 -Mode remediate -Level ${CisLevel} -Profile ${CisProfile}
+            - name: validate
+              steps:
+                - name: Audit
+                  action: ExecutePowerShell
+                  inputs:
+                    commands:
+                      - C:\CISHardening\windows2025-cis\run.ps1 -Mode audit -Level ${CisLevel} -Profile ${CisProfile}
+        - ArtifactParameterName: !Sub '/${NamePrefix}/artifacts/windows2025/s3-uri'
+
+  ImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub '${NamePrefix}-windows2025-cis'
+      Version: 1.0.0
+      ParentImage: !Ref BaseAmiId
+      Components:
+        - ComponentArn: !Ref HardeningComponent
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 50
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+            KmsKeyId: !ImportValue
+              Fn::Sub: '${NamePrefix}-KmsKeyArn'
+
+  InfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub '${NamePrefix}-windows2025-cis'
+      InstanceProfileName: !ImportValue
+        Fn::Sub: '${NamePrefix}-ImageBuilderInstanceProfileName'
+      InstanceTypes: [!Ref InstanceType]
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: !Ref SecurityGroupIds
+      TerminateInstanceOnFailure: true
+      SnsTopicArn: !ImportValue
+        Fn::Sub: '${NamePrefix}-SnsTopicArn'
+      # Literal tag keys - see the matching note in 01-image-builder-rhel.yaml.
+      ResourceTags:
+        CISBenchmark: WindowsServer2025
+        CISBenchmarkLevel: !Ref CisLevel
+
+  DistributionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub '${NamePrefix}-windows2025-cis'
+      Distributions:
+        - Region: !Ref AWS::Region
+          AmiDistributionConfiguration:
+            Name: !Sub '${NamePrefix}-windows2025-cis-{{ imagebuilder:buildDate }}'
+            KmsKeyId: !ImportValue
+              Fn::Sub: '${NamePrefix}-KmsKeyArn'
+            AmiTags:
+              CISBenchmark: WindowsServer2025
+              CISBenchmarkLevel: !Ref CisLevel
+            LaunchPermissionConfiguration: !If
+              - HasLandingZoneAccounts
+              - UserIds: !Ref LandingZoneAccountIds
+              - !Ref AWS::NoValue
+
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub '${NamePrefix}-windows2025-cis'
+      ImageRecipeArn: !Ref ImageRecipe
+      InfrastructureConfigurationArn: !Ref InfrastructureConfiguration
+      DistributionConfigurationArn: !Ref DistributionConfiguration
+      Status: ENABLED
+      Schedule:
+        ScheduleExpression: !Ref PipelineScheduleExpression
+        PipelineExecutionStartCondition: EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE
+      ImageTestsConfiguration:
+        ImageTestsEnabled: true
+        TimeoutMinutes: 120
+
+  PipelineStateChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${NamePrefix}-windows2025-cis-pipeline-state'
+      EventPattern:
+        source: [aws.imagebuilder]
+        detail-type: ['EC2 Image Builder Image State Change']
+      Targets:
+        - Id: sns
+          Arn: !ImportValue
+            Fn::Sub: '${NamePrefix}-SnsTopicArn'
+
+Outputs:
+  PipelineArn:
+    Value: !Ref ImagePipeline
+  RecipeArn:
+    Value: !Ref ImageRecipe

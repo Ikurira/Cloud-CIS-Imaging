@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  CIS hardening pipeline - SSM State Manager continuous enforcement for both
+  RHEL9 and Windows Server 2025. Deploy 00-shared.yaml first with the same
+  NamePrefix. See ../../docs/architecture.md.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: cis-hardening
+
+  CisLevel:
+    Type: String
+    Default: '1'
+    AllowedValues: ['1', '2']
+
+  CisProfile:
+    Type: String
+    Default: server
+    AllowedValues: [server, workstation]
+
+  EnforcementSchedule:
+    Type: String
+    Default: rate(1 day)
+
+  ComplianceSeverity:
+    Type: String
+    Default: HIGH
+
+Resources:
+  EnforceRhel9Document:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${NamePrefix}-enforce-rhel9'
+      DocumentType: Command
+      DocumentFormat: YAML
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: '2.2'
+        description: >-
+          CIS RHEL9 continuous enforcement + compliance reporting. Native bash
+          only. Re-pulls the current hardening-content artifact, runs it in
+          remediate mode, then publishes results to SSM Compliance.
+        parameters:
+          ArtifactParameterName:
+            type: String
+            default: !Sub '/${NamePrefix}/artifacts/rhel9/s3-uri'
+          CisLevel:
+            type: String
+            default: !Ref CisLevel
+          CisProfile:
+            type: String
+            default: !Ref CisProfile
+          ComplianceType:
+            type: String
+            default: 'Custom:CIS-RHEL9'
+        mainSteps:
+          - action: aws:runShellScript
+            name: EnforceAndReportCompliance
+            inputs:
+              timeoutSeconds: '1800'
+              runCommand:
+                - |
+                  set -e
+                  command -v jq >/dev/null 2>&1 || dnf install -y jq >/dev/null 2>&1 || true
+
+                  TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+                  REGION=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+                  INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+                  S3_URI=$(aws ssm get-parameter --name "{{ ArtifactParameterName }}" --region "$REGION" --query 'Parameter.Value' --output text)
+                  echo "Resolved hardening artifact: $S3_URI"
+
+                  mkdir -p /opt/cis-hardening
+                  aws s3 cp "$S3_URI" /opt/cis-hardening/rhel9-cis.tar.gz --region "$REGION"
+                  rm -rf /opt/cis-hardening/rhel9-cis
+                  tar -xzf /opt/cis-hardening/rhel9-cis.tar.gz -C /opt/cis-hardening
+                  chmod +x /opt/cis-hardening/rhel9-cis/run.sh
+
+                  mkdir -p /var/log/cis-hardening
+                  rm -f /var/log/cis-hardening/results.jsonl
+
+                  /opt/cis-hardening/rhel9-cis/run.sh --mode remediate --level "{{ CisLevel }}" --profile "{{ CisProfile }}" || true
+
+                  jq -s '[.[] | select(.status != "skipped") | {
+                      Id: .control_id,
+                      Title: .title,
+                      Severity: (if (.level|tonumber) == 1 then "HIGH" else "MEDIUM" end),
+                      Status: (if .status == "pass" then "COMPLIANT" else "NON_COMPLIANT" end)
+                    }]' /var/log/cis-hardening/results.jsonl > /tmp/compliance-items.json
+
+                  aws ssm put-compliance-items \
+                    --resource-id "$INSTANCE_ID" \
+                    --resource-type ManagedInstance \
+                    --compliance-type "{{ ComplianceType }}" \
+                    --execution-summary ExecutionTime="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                    --items file:///tmp/compliance-items.json \
+                    --region "$REGION"
+
+  EnforceWindows2025Document:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${NamePrefix}-enforce-windows2025'
+      DocumentType: Command
+      DocumentFormat: YAML
+      TargetType: /AWS::EC2::Instance
+      Content:
+        schemaVersion: '2.2'
+        description: >-
+          CIS Windows Server 2025 continuous enforcement + compliance
+          reporting. Native PowerShell only. Re-pulls the current
+          hardening-content artifact, runs it in remediate mode, then
+          publishes results to SSM Compliance.
+        parameters:
+          ArtifactParameterName:
+            type: String
+            default: !Sub '/${NamePrefix}/artifacts/windows2025/s3-uri'
+          CisLevel:
+            type: String
+            default: !Ref CisLevel
+          CisProfile:
+            type: String
+            default: !Ref CisProfile
+          ComplianceType:
+            type: String
+            default: 'Custom:CIS-WindowsServer2025'
+        mainSteps:
+          - action: aws:runPowerShellScript
+            name: EnforceAndReportCompliance
+            inputs:
+              timeoutSeconds: '3600'
+              runCommand:
+                - |
+                  $ErrorActionPreference = "Stop"
+
+                  $token      = Invoke-RestMethod -Method PUT -Uri http://169.254.169.254/latest/api/token -Headers @{"X-aws-ec2-metadata-token-ttl-seconds"="60"}
+                  $region     = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token"=$token} -Uri http://169.254.169.254/latest/meta-data/placement/region
+                  $instanceId = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token"=$token} -Uri http://169.254.169.254/latest/meta-data/instance-id
+
+                  $s3Uri = (Get-SSMParameter -Name "{{ ArtifactParameterName }}" -Region $region).Value
+                  Write-Host "Resolved hardening artifact: $s3Uri"
+
+                  New-Item -ItemType Directory -Force -Path C:\CISHardening | Out-Null
+                  $parts  = $s3Uri -replace '^s3://', '' -split '/', 2
+                  $bucket = $parts[0]
+                  $key    = $parts[1]
+                  Read-S3Object -BucketName $bucket -Key $key -File C:\CISHardening\windows2025-cis.zip -Region $region
+
+                  Remove-Item -Recurse -Force C:\CISHardening\windows2025-cis -ErrorAction SilentlyContinue
+                  Expand-Archive -Path C:\CISHardening\windows2025-cis.zip -DestinationPath C:\CISHardening -Force
+
+                  New-Item -ItemType Directory -Force -Path C:\ProgramData\CISHardening | Out-Null
+                  Remove-Item -Force C:\ProgramData\CISHardening\results.jsonl -ErrorAction SilentlyContinue
+
+                  & C:\CISHardening\windows2025-cis\run.ps1 -Mode remediate -Level ([int]"{{ CisLevel }}") -Profile "{{ CisProfile }}"
+
+                  $results = Get-Content C:\ProgramData\CISHardening\results.jsonl | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }
+
+                  $items = @()
+                  foreach ($r in ($results | Where-Object { $_.status -ne "skipped" })) {
+                      $items += @{
+                          Id       = $r.control_id
+                          Title    = $r.title
+                          Severity = if ([int]$r.level -eq 1) { "High" } else { "Medium" }
+                          Status   = if ($r.status -eq "pass") { "Compliant" } else { "Non_Compliant" }
+                      }
+                  }
+
+                  Write-SSMComplianceItem `
+                    -ResourceId $instanceId `
+                    -ResourceType ManagedInstance `
+                    -ComplianceType "{{ ComplianceType }}" `
+                    -ExecutionSummary_ExecutionTime (Get-Date).ToUniversalTime() `
+                    -Item $items `
+                    -Region $region
+
+  EnforceRhel9Association:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref EnforceRhel9Document
+      AssociationName: !Sub '${NamePrefix}-enforce-rhel9'
+      Targets:
+        - Key: !Sub
+            - 'tag:${TagKey}'
+            - TagKey: !ImportValue { 'Fn::Sub': '${NamePrefix}-TagKeyBenchmark' }
+          Values:
+            - !ImportValue { 'Fn::Sub': '${NamePrefix}-TagValueRhel9' }
+      ScheduleExpression: !Ref EnforcementSchedule
+      ApplyOnlyAtCronInterval: false
+      ComplianceSeverity: !Ref ComplianceSeverity
+      MaxConcurrency: '50%'
+      MaxErrors: '25%'
+
+  EnforceWindows2025Association:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref EnforceWindows2025Document
+      AssociationName: !Sub '${NamePrefix}-enforce-windows2025'
+      Targets:
+        - Key: !Sub
+            - 'tag:${TagKey}'
+            - TagKey: !ImportValue { 'Fn::Sub': '${NamePrefix}-TagKeyBenchmark' }
+          Values:
+            - !ImportValue { 'Fn::Sub': '${NamePrefix}-TagValueWindows2025' }
+      ScheduleExpression: !Ref EnforcementSchedule
+      ApplyOnlyAtCronInterval: false
+      ComplianceSeverity: !Ref ComplianceSeverity
+      MaxConcurrency: '50%'
+      MaxErrors: '25%'
+
+Outputs:
+  EnforceDocumentNameRhel9:
+    Value: !Ref EnforceRhel9Document
+    Export:
+      Name: !Sub '${NamePrefix}-EnforceDocumentNameRhel9'
+
+  EnforceDocumentNameWindows2025:
+    Value: !Ref EnforceWindows2025Document
+    Export:
+      Name: !Sub '${NamePrefix}-EnforceDocumentNameWindows2025'
