@@ -1,0 +1,62 @@
+schemaVersion: '2.2'
+description: >-
+  CIS RHEL9 continuous enforcement + compliance reporting. Native bash only —
+  no Ansible, no external control node. Re-pulls the current hardening-content
+  artifact (see hardening-content/CONTRACT.md), runs it in remediate mode, then
+  publishes the result stream to SSM Compliance so AWS Config can evaluate it.
+parameters:
+  ArtifactParameterName:
+    type: String
+    description: SSM Parameter (from modules/shared) that resolves to the current RHEL9 artifact S3 URI.
+    default: /cis-hardening/artifacts/rhel9/s3-uri
+  CisLevel:
+    type: String
+    default: '1'
+  CisProfile:
+    type: String
+    default: server
+  ComplianceType:
+    type: String
+    default: 'Custom:CIS-RHEL9'
+mainSteps:
+  - action: aws:runShellScript
+    name: EnforceAndReportCompliance
+    inputs:
+      timeoutSeconds: '1800'
+      runCommand:
+        - |
+          set -e
+          command -v jq >/dev/null 2>&1 || dnf install -y jq >/dev/null 2>&1 || true
+
+          TOKEN=$(curl -sf -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+          REGION=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+          INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+          S3_URI=$(aws ssm get-parameter --name "{{ ArtifactParameterName }}" --region "$REGION" --query 'Parameter.Value' --output text)
+          echo "Resolved hardening artifact: $S3_URI"
+
+          mkdir -p /opt/cis-hardening
+          aws s3 cp "$S3_URI" /opt/cis-hardening/rhel9-cis.tar.gz --region "$REGION"
+          rm -rf /opt/cis-hardening/rhel9-cis
+          tar -xzf /opt/cis-hardening/rhel9-cis.tar.gz -C /opt/cis-hardening
+          chmod +x /opt/cis-hardening/rhel9-cis/run.sh
+
+          mkdir -p /var/log/cis-hardening
+          rm -f /var/log/cis-hardening/results.jsonl
+
+          /opt/cis-hardening/rhel9-cis/run.sh --mode remediate --level "{{ CisLevel }}" --profile "{{ CisProfile }}" || true
+
+          jq -s '[.[] | select(.status != "skipped") | {
+              Id: .control_id,
+              Title: .title,
+              Severity: (if (.level|tonumber) == 1 then "HIGH" else "MEDIUM" end),
+              Status: (if .status == "pass" then "COMPLIANT" else "NON_COMPLIANT" end)
+            }]' /var/log/cis-hardening/results.jsonl > /tmp/compliance-items.json
+
+          aws ssm put-compliance-items \
+            --resource-id "$INSTANCE_ID" \
+            --resource-type ManagedInstance \
+            --compliance-type "{{ ComplianceType }}" \
+            --execution-summary ExecutionTime="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --items file:///tmp/compliance-items.json \
+            --region "$REGION"

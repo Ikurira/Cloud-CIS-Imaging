@@ -1,0 +1,37 @@
+name: WindowsServer2025-CIS-Hardening
+description: >-
+  Applies CIS Windows Server 2025 hardening natively (PowerShell only, no
+  Ansible/WinRM/external control node). Resolves the current hardening-content
+  artifact location from SSM Parameter Store at build time so this component
+  never needs to change when the content package is revised — see
+  hardening-content/CONTRACT.md.
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: DownloadHardeningArtifact
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - $ErrorActionPreference = "Stop"
+            - $s3Uri = (Get-SSMParameter -Name '${artifact_parameter_name}' -Region '${region}').Value
+            - Write-Host "Resolved hardening artifact: $s3Uri"
+            - New-Item -ItemType Directory -Force -Path C:\CISHardening | Out-Null
+            - $bucket, $key = $s3Uri -replace '^s3://', '' -split '/', 2
+            - Read-S3Object -BucketName $bucket -Key $key -File C:\CISHardening\windows2025-cis.zip -Region '${region}'
+            - Expand-Archive -Path C:\CISHardening\windows2025-cis.zip -DestinationPath C:\CISHardening -Force
+
+      - name: Remediate
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - C:\CISHardening\windows2025-cis\run.ps1 -Mode remediate -Level ${cis_level} -Profile ${cis_profile}
+
+  - name: validate
+    steps:
+      - name: Audit
+        action: ExecutePowerShell
+        inputs:
+          commands:
+            - C:\CISHardening\windows2025-cis\run.ps1 -Mode audit -Level ${cis_level} -Profile ${cis_profile}

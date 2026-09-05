@@ -1,0 +1,70 @@
+schemaVersion: '2.2'
+description: >-
+  CIS Windows Server 2025 continuous enforcement + compliance reporting.
+  Native PowerShell only — no Ansible, no WinRM control node. Re-pulls the
+  current hardening-content artifact (see hardening-content/CONTRACT.md), runs
+  it in remediate mode, then publishes the result stream to SSM Compliance so
+  AWS Config can evaluate it.
+parameters:
+  ArtifactParameterName:
+    type: String
+    description: SSM Parameter (from modules/shared) that resolves to the current Windows Server 2025 artifact S3 URI.
+    default: /cis-hardening/artifacts/windows2025/s3-uri
+  CisLevel:
+    type: String
+    default: '1'
+  CisProfile:
+    type: String
+    default: server
+  ComplianceType:
+    type: String
+    default: 'Custom:CIS-WindowsServer2025'
+mainSteps:
+  - action: aws:runPowerShellScript
+    name: EnforceAndReportCompliance
+    inputs:
+      timeoutSeconds: '3600'
+      runCommand:
+        - |
+          $ErrorActionPreference = "Stop"
+
+          $token      = Invoke-RestMethod -Method PUT -Uri http://169.254.169.254/latest/api/token -Headers @{"X-aws-ec2-metadata-token-ttl-seconds"="60"}
+          $region     = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token"=$token} -Uri http://169.254.169.254/latest/meta-data/placement/region
+          $instanceId = Invoke-RestMethod -Headers @{"X-aws-ec2-metadata-token"=$token} -Uri http://169.254.169.254/latest/meta-data/instance-id
+
+          $s3Uri = (Get-SSMParameter -Name "{{ ArtifactParameterName }}" -Region $region).Value
+          Write-Host "Resolved hardening artifact: $s3Uri"
+
+          New-Item -ItemType Directory -Force -Path C:\CISHardening | Out-Null
+          $parts  = $s3Uri -replace '^s3://', '' -split '/', 2
+          $bucket = $parts[0]
+          $key    = $parts[1]
+          Read-S3Object -BucketName $bucket -Key $key -File C:\CISHardening\windows2025-cis.zip -Region $region
+
+          Remove-Item -Recurse -Force C:\CISHardening\windows2025-cis -ErrorAction SilentlyContinue
+          Expand-Archive -Path C:\CISHardening\windows2025-cis.zip -DestinationPath C:\CISHardening -Force
+
+          New-Item -ItemType Directory -Force -Path C:\ProgramData\CISHardening | Out-Null
+          Remove-Item -Force C:\ProgramData\CISHardening\results.jsonl -ErrorAction SilentlyContinue
+
+          & C:\CISHardening\windows2025-cis\run.ps1 -Mode remediate -Level ([int]"{{ CisLevel }}") -Profile "{{ CisProfile }}"
+
+          $results = Get-Content C:\ProgramData\CISHardening\results.jsonl | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }
+
+          $items = @()
+          foreach ($r in ($results | Where-Object { $_.status -ne "skipped" })) {
+              $items += @{
+                  Id       = $r.control_id
+                  Title    = $r.title
+                  Severity = if ([int]$r.level -eq 1) { "High" } else { "Medium" }
+                  Status   = if ($r.status -eq "pass") { "Compliant" } else { "Non_Compliant" }
+              }
+          }
+
+          Write-SSMComplianceItem `
+            -ResourceId $instanceId `
+            -ResourceType ManagedInstance `
+            -ComplianceType "{{ ComplianceType }}" `
+            -ExecutionSummary_ExecutionTime (Get-Date).ToUniversalTime() `
+            -Item $items `
+            -Region $region

@@ -1,0 +1,44 @@
+schemaVersion: '0.3'
+description: >-
+  Generic CIS auto-remediation runbook. Fired by AWS Config's Remediation
+  Configuration (see modules/config-compliance's conformance pack) when a
+  Config rule reports NON_COMPLIANT for an instance. Re-invokes the same
+  enforcement SSM document State Manager already uses for continuous
+  enforcement (modules/ssm-enforcement) — this runbook never contains
+  benchmark-specific logic itself, it only knows how to run a named document
+  against a named instance. Which document/instance is entirely parameter-
+  driven, so this one runbook backs every OS the pipeline supports.
+assumeRole: '{{ AutomationAssumeRole }}'
+parameters:
+  InstanceId:
+    type: String
+    description: The non-compliant instance, supplied by AWS Config from the rule's evaluation.
+  EnforceDocumentName:
+    type: String
+    description: Name of the enforcement SSM Command document to re-run on InstanceId.
+  AutomationAssumeRole:
+    type: String
+    description: Role this automation executes as.
+    default: '${automation_role_arn}'
+  SnsTopicArn:
+    type: String
+    description: Pipeline notification topic (modules/shared).
+    default: '${sns_topic_arn}'
+mainSteps:
+  - name: RunEnforcement
+    action: aws:runCommand
+    timeoutSeconds: 3600
+    inputs:
+      DocumentName: '{{ EnforceDocumentName }}'
+      InstanceIds:
+        - '{{ InstanceId }}'
+
+  - name: Notify
+    action: aws:executeAwsApi
+    isEnd: true
+    inputs:
+      Service: sns
+      Api: Publish
+      TopicArn: '{{ SnsTopicArn }}'
+      Message: 'CIS auto-remediation executed on {{ InstanceId }} via {{ EnforceDocumentName }}'
+      Subject: 'CIS auto-remediation fired'

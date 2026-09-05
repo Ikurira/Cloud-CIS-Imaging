@@ -1,0 +1,106 @@
+Parameters:
+  LambdaFunctionArn:
+    Type: String
+  AutomationAssumeRoleArn:
+    Type: String
+  EnforceDocumentNameRhel9:
+    Type: String
+  EnforceDocumentNameWindows2025:
+    Type: String
+  TagKeyBenchmark:
+    Type: String
+  TagValueRhel9:
+    Type: String
+  TagValueWindows2025:
+    Type: String
+
+Resources:
+  CisRhel9ComplianceRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: ${name_prefix}-cis-rhel9-compliance
+      Description: >-
+        Evaluates EC2 instances tagged as RHEL9 CIS-hardened against the
+        Custom:CIS-RHEL9 compliance type published by the SSM State Manager
+        enforcement association (modules/ssm-enforcement). Never inspects the
+        instance directly.
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !Ref LambdaFunctionArn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: One_Hour
+      InputParameters:
+        Fn::Sub:
+          - '{"ComplianceType":"Custom:CIS-RHEL9","TagKey":"$${TagKey}","TagValue":"$${TagValue}"}'
+          - TagKey: !Ref TagKeyBenchmark
+            TagValue: !Ref TagValueRhel9
+
+  CisRhel9Remediation:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref CisRhel9ComplianceRule
+      TargetType: SSM_DOCUMENT
+      TargetId: ${automation_document_name}
+      TargetVersion: "1"
+      Automatic: true
+      MaximumAutomaticAttempts: 3
+      RetryAttemptSeconds: 600
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !Ref AutomationAssumeRoleArn
+        InstanceId:
+          ResourceValue:
+            Value: RESOURCE_ID
+        EnforceDocumentName:
+          StaticValue:
+            Values:
+              - !Ref EnforceDocumentNameRhel9
+
+  CisWindows2025ComplianceRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: ${name_prefix}-cis-windows2025-compliance
+      Description: >-
+        Evaluates EC2 instances tagged as Windows Server 2025 CIS-hardened
+        against the Custom:CIS-WindowsServer2025 compliance type published by
+        the SSM State Manager enforcement association. Never inspects the
+        instance directly.
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !Ref LambdaFunctionArn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: One_Hour
+      InputParameters:
+        Fn::Sub:
+          - '{"ComplianceType":"Custom:CIS-WindowsServer2025","TagKey":"$${TagKey}","TagValue":"$${TagValue}"}'
+          - TagKey: !Ref TagKeyBenchmark
+            TagValue: !Ref TagValueWindows2025
+
+  CisWindows2025Remediation:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref CisWindows2025ComplianceRule
+      TargetType: SSM_DOCUMENT
+      TargetId: ${automation_document_name}
+      TargetVersion: "1"
+      Automatic: true
+      MaximumAutomaticAttempts: 3
+      RetryAttemptSeconds: 600
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !Ref AutomationAssumeRoleArn
+        InstanceId:
+          ResourceValue:
+            Value: RESOURCE_ID
+        EnforceDocumentName:
+          StaticValue:
+            Values:
+              - !Ref EnforceDocumentNameWindows2025

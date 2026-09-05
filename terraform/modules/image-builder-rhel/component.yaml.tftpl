@@ -1,0 +1,43 @@
+name: RHEL9-CIS-Hardening
+description: >-
+  Applies CIS RHEL 9 hardening natively (no Ansible, no external control node).
+  Resolves the current hardening-content artifact location from SSM Parameter
+  Store at build time so this component never needs to change when the content
+  package is revised — see hardening-content/CONTRACT.md.
+schemaVersion: 1.0
+
+phases:
+  - name: build
+    steps:
+      - name: InstallPrereqs
+        action: ExecuteBash
+        inputs:
+          commands:
+            - set -e
+            - dnf install -y unzip tar >/dev/null
+
+      - name: DownloadHardeningArtifact
+        action: ExecuteBash
+        inputs:
+          commands:
+            - set -e
+            - S3_URI=$(aws ssm get-parameter --name '${artifact_parameter_name}' --region '${region}' --query 'Parameter.Value' --output text)
+            - echo "Resolved hardening artifact: $S3_URI"
+            - mkdir -p /opt/cis-hardening
+            - aws s3 cp "$S3_URI" /opt/cis-hardening/rhel9-cis.tar.gz --region '${region}'
+            - tar -xzf /opt/cis-hardening/rhel9-cis.tar.gz -C /opt/cis-hardening
+            - chmod +x /opt/cis-hardening/rhel9-cis/run.sh
+
+      - name: Remediate
+        action: ExecuteBash
+        inputs:
+          commands:
+            - /opt/cis-hardening/rhel9-cis/run.sh --mode remediate --level ${cis_level} --profile ${cis_profile}
+
+  - name: validate
+    steps:
+      - name: Audit
+        action: ExecuteBash
+        inputs:
+          commands:
+            - /opt/cis-hardening/rhel9-cis/run.sh --mode audit --level ${cis_level} --profile ${cis_profile}
